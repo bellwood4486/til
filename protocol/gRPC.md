@@ -76,7 +76,6 @@ server側
 2021/02/28 00:10:26 http2: decoded hpack field header field "grpc-timeout" = "999965u"
 ```
 1秒を指定しているが、なぜか若干小さい値になっている。
-```
 
 
 ## 参考文献
