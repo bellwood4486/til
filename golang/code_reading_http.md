@@ -110,15 +110,18 @@ func (srv *Server) Serve(l net.Listener) error {
 
 ```go
 func (c *conn) serve(ctx context.Context) {
+	// なぜこの位置で`c.remoteAddr`にセットしているかは、`remoteAddr`フィールドのコメントに書いてある
 	c.remoteAddr = c.rwc.RemoteAddr().String()
 	ctx = context.WithValue(ctx, LocalAddrContextKey, c.rwc.LocalAddr())
 	defer func() {
+		// パニックだけど`ErrAboatHandler`を使えば、サーバーのログを残す以下の処理をスキップできる。
 		if err := recover(); err != nil && err != ErrAbortHandler {
 			const size = 64 << 10
 			buf := make([]byte, size)
 			buf = buf[:runtime.Stack(buf, false)]
 			c.server.logf("http: panic serving %v: %v\n%s", c.remoteAddr, err, buf)
 		}
+		// hijackはよくわかってない
 		if !c.hijacked() {
 			c.close()
 			c.setState(c.rwc, StateClosed, runHooks)
