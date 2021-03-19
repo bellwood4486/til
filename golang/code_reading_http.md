@@ -362,8 +362,9 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	}
 	delete(req.Header, "Host")
 	
-	// 前段の
+	// `*conn.Serve()`だけでなく、さらにここでも`context.WithCancel()`でキャンセル用Funcが作られる
 	ctx, cancelCtx := context.WithCancel(ctx)
+	// contextはrequestのほうに詰めているが、`cancelCtx`はresuponse側に詰めているのはどういう意図か？？
 	req.ctx = ctx
 	req.RemoteAddr = c.remoteAddr
 	req.TLS = c.tlsState
@@ -372,6 +373,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	}
 
 	// Adjust the read deadline if necessary.
+	// ここでようやく`wholeReqDeadline`が登場する。
 	if !hdrDeadline.Equal(wholeReqDeadline) {
 		c.rwc.SetReadDeadline(wholeReqDeadline)
 	}
