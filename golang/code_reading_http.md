@@ -165,14 +165,22 @@ func (c *conn) serve(ctx context.Context) {
 	// HTTP/1.x from here on.
 
 	ctx, cancelCtx := context.WithCancel(ctx)
+	// ここでセットされる`c.cancelCtx`が呼ばれるのは以下の2箇所のみ。どちらもエラーをエラーをハンドリングするときに呼ばれている。
+	//   - (*connReader).handleReadError()
+	//   - (checkConnErrorWriter).Write()
 	c.cancelCtx = cancelCtx
 	defer cancelCtx()
-
+	
+	// `connReader`とは何者か？
+	//   - `http.conn`経由でリクエストを読み、その結果を`http.conn`の適切なフィールドに詰める役割
+	//   - 読み込み時にエラーになったときの挙動もこれに書かれている
 	c.r = &connReader{conn: c}
 	c.bufr = newBufioReader(c.r)
 	c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
 
 	for {
+		// この`readRequest()`内で、このconnの一つ下の層(TCPなど)のタイムアウトが設定されている
+		// HTTP関連のタイムアウトが同実現されているかを調べるときに関係ありそう。
 		w, err := c.readRequest(ctx)
 		if c.r.remain != c.server.initialReadLimitSize() {
 			// If we read any bytes off the wire, we're active.
@@ -280,3 +288,115 @@ func (c *conn) serve(ctx context.Context) {
 	}
 }
 ```
+
+### (*conn).readRequest
+
+```go
+// Read next request from connection.
+func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
+	if c.hijacked() {
+		return nil, ErrHijacked
+	}
+
+	var (
+		wholeReqDeadline time.Time // or zero if none
+		hdrDeadline      time.Time // or zero if none
+	)
+	t0 := time.Now()
+	if d := c.server.readHeaderTimeout(); d != 0 {
+		hdrDeadline = t0.Add(d)
+	}
+	if d := c.server.ReadTimeout; d != 0 {
+		wholeReqDeadline = t0.Add(d)
+	}
+	c.rwc.SetReadDeadline(hdrDeadline)
+	if d := c.server.WriteTimeout; d != 0 {
+		defer func() {
+			c.rwc.SetWriteDeadline(time.Now().Add(d))
+		}()
+	}
+
+	c.r.setReadLimit(c.server.initialReadLimitSize())
+	if c.lastMethod == "POST" {
+		// RFC 7230 section 3 tolerance for old buggy clients.
+		peek, _ := c.bufr.Peek(4) // ReadRequest will get err below
+		c.bufr.Discard(numLeadingCRorLF(peek))
+	}
+	
+	// ここでようやくよく見る`http.Request`構造体が登場する。
+	req, err := readRequest(c.bufr, keepHostHeader)
+	if err != nil {
+		if c.r.hitReadLimit() {
+			return nil, errTooLarge
+		}
+		return nil, err
+	}
+
+	if !http1ServerSupportsRequest(req) {
+		return nil, statusError{StatusHTTPVersionNotSupported, "unsupported protocol version"}
+	}
+
+	c.lastMethod = req.Method
+	c.r.setInfiniteReadLimit()
+
+	hosts, haveHost := req.Header["Host"]
+	isH2Upgrade := req.isH2Upgrade()
+	if req.ProtoAtLeast(1, 1) && (!haveHost || len(hosts) == 0) && !isH2Upgrade && req.Method != "CONNECT" {
+		return nil, badRequestError("missing required Host header")
+	}
+	if len(hosts) > 1 {
+		return nil, badRequestError("too many Host headers")
+	}
+	if len(hosts) == 1 && !httpguts.ValidHostHeader(hosts[0]) {
+		return nil, badRequestError("malformed Host header")
+	}
+	for k, vv := range req.Header {
+		if !httpguts.ValidHeaderFieldName(k) {
+			return nil, badRequestError("invalid header name")
+		}
+		for _, v := range vv {
+			if !httpguts.ValidHeaderFieldValue(v) {
+				return nil, badRequestError("invalid header value")
+			}
+		}
+	}
+	delete(req.Header, "Host")
+	
+	// 前段の
+	ctx, cancelCtx := context.WithCancel(ctx)
+	req.ctx = ctx
+	req.RemoteAddr = c.remoteAddr
+	req.TLS = c.tlsState
+	if body, ok := req.Body.(*body); ok {
+		body.doEarlyClose = true
+	}
+
+	// Adjust the read deadline if necessary.
+	if !hdrDeadline.Equal(wholeReqDeadline) {
+		c.rwc.SetReadDeadline(wholeReqDeadline)
+	}
+
+	w = &response{
+		conn:          c,
+		cancelCtx:     cancelCtx,
+		req:           req,
+		reqBody:       req.Body,
+		handlerHeader: make(Header),
+		contentLength: -1,
+		closeNotifyCh: make(chan bool, 1),
+
+		// We populate these ahead of time so we're not
+		// reading from req.Header after their Handler starts
+		// and maybe mutates it (Issue 14940)
+		wants10KeepAlive: req.wantsHttp10KeepAlive(),
+		wantsClose:       req.wantsClose(),
+	}
+	if isH2Upgrade {
+		w.closeAfterReply = true
+	}
+	w.cw.res = w
+	w.w = newBufioWriterSize(&w.cw, bufferBeforeChunkingSize)
+	return w, nil
+}
+```
+					return
