@@ -401,4 +401,232 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	return w, nil
 }
 ```
-					return
+
+### http.readRequest()
+
+```go
+func readRequest(b *bufio.Reader, deleteHostHeader bool) (req *Request, err error) {
+	// この"Textproto"は"Text Protocol"の略。`textproto`というパッケージがある。
+	tp := newTextprotoReader(b)
+	req = new(Request)
+
+	// First line: GET /index.html HTTP/1.0
+	var s string
+	if s, err = tp.ReadLine(); err != nil {
+		return nil, err
+	}
+	defer func() {
+		putTextprotoReader(tp)
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	var ok bool
+	req.Method, req.RequestURI, req.Proto, ok = parseRequestLine(s)
+	if !ok {
+		return nil, badStringError("malformed HTTP request", s)
+	}
+	if !validMethod(req.Method) {
+		return nil, badStringError("invalid method", req.Method)
+	}
+	rawurl := req.RequestURI
+	if req.ProtoMajor, req.ProtoMinor, ok = ParseHTTPVersion(req.Proto); !ok {
+		return nil, badStringError("malformed HTTP version", req.Proto)
+	}
+
+	// CONNECT requests are used two different ways, and neither uses a full URL:
+	// The standard use is to tunnel HTTPS through an HTTP proxy.
+	// It looks like "CONNECT www.google.com:443 HTTP/1.1", and the parameter is
+	// just the authority section of a URL. This information should go in req.URL.Host.
+	//
+	// The net/rpc package also uses CONNECT, but there the parameter is a path
+	// that starts with a slash. It can be parsed with the regular URL parser,
+	// and the path will end up in req.URL.Path, where it needs to be in order for
+	// RPC to work.
+	justAuthority := req.Method == "CONNECT" && !strings.HasPrefix(rawurl, "/")
+	if justAuthority {
+		rawurl = "http://" + rawurl
+	}
+	// ここで解析されたURLがリクエストに詰められる。
+	if req.URL, err = url.ParseRequestURI(rawurl); err != nil {
+		return nil, err
+	}
+
+	if justAuthority {
+		// Strip the bogus "http://" back off.
+		req.URL.Scheme = ""
+	}
+
+	// Text Protocol Readerでは、次の行がどのフォーマットかは呼び出し側が決める。
+	//   ここでは次はヘッダーなので`ReadMIMEHeader()`を呼び出している。
+	//  `ReadMIMEHeader()`は空行までを読み込みマップで返す。
+	//
+	// Subsequent lines: Key: value.
+	mimeHeader, err := tp.ReadMIMEHeader()
+	if err != nil {
+		return nil, err
+	}
+	req.Header = Header(mimeHeader)
+
+	// RFC 7230, section 5.3: Must treat
+	//	GET /index.html HTTP/1.1
+	//	Host: www.google.com
+	// and
+	//	GET http://www.google.com/index.html HTTP/1.1
+	//	Host: doesntmatter
+	// the same. In the second case, any Host line is ignored.
+	req.Host = req.URL.Host
+	if req.Host == "" {
+		req.Host = req.Header.get("Host")
+	}
+	if deleteHostHeader {
+		delete(req.Header, "Host")
+	}
+
+	fixPragmaCacheControl(req.Header)
+
+	req.Close = shouldClose(req.ProtoMajor, req.ProtoMinor, req.Header, false)
+
+	err = readTransfer(req, b)
+	if err != nil {
+		return nil, err
+	}
+
+	if req.isH2Upgrade() {
+		// Because it's neither chunked, nor declared:
+		req.ContentLength = -1
+
+		// We want to give handlers a chance to hijack the
+		// connection, but we need to prevent the Server from
+		// dealing with the connection further if it's not
+		// hijacked. Set Close to ensure that:
+		req.Close = true
+	}
+	return req, nil
+}
+```
+
+### http.readTransfer()
+
+```go
+// msg is *Request or *Response.
+func readTransfer(msg interface{}, r *bufio.Reader) (err error) {
+	t := &transferReader{RequestMethod: "GET"}
+
+	// Unify input
+	isResponse := false
+	switch rr := msg.(type) {
+	case *Response:
+		t.Header = rr.Header
+		t.StatusCode = rr.StatusCode
+		t.ProtoMajor = rr.ProtoMajor
+		t.ProtoMinor = rr.ProtoMinor
+		t.Close = shouldClose(t.ProtoMajor, t.ProtoMinor, t.Header, true)
+		isResponse = true
+		if rr.Request != nil {
+			t.RequestMethod = rr.Request.Method
+		}
+	case *Request:
+		t.Header = rr.Header
+		t.RequestMethod = rr.Method
+		t.ProtoMajor = rr.ProtoMajor
+		t.ProtoMinor = rr.ProtoMinor
+		// Transfer semantics for Requests are exactly like those for
+		// Responses with status code 200, responding to a GET method
+		t.StatusCode = 200
+		t.Close = rr.Close
+	default:
+		panic("unexpected type")
+	}
+
+	// Default to HTTP/1.1
+	if t.ProtoMajor == 0 && t.ProtoMinor == 0 {
+		t.ProtoMajor, t.ProtoMinor = 1, 1
+	}
+
+	// Transfer-Encoding: chunked, and overriding Content-Length.
+	if err := t.parseTransferEncoding(); err != nil {
+		return err
+	}
+
+	realLength, err := fixLength(isResponse, t.StatusCode, t.RequestMethod, t.Header, t.Chunked)
+	if err != nil {
+		return err
+	}
+	if isResponse && t.RequestMethod == "HEAD" {
+		if n, err := parseContentLength(t.Header.get("Content-Length")); err != nil {
+			return err
+		} else {
+			t.ContentLength = n
+		}
+	} else {
+		t.ContentLength = realLength
+	}
+
+	// Trailer
+	t.Trailer, err = fixTrailer(t.Header, t.Chunked)
+	if err != nil {
+		return err
+	}
+
+	// If there is no Content-Length or chunked Transfer-Encoding on a *Response
+	// and the status is not 1xx, 204 or 304, then the body is unbounded.
+	// See RFC 7230, section 3.3.
+	switch msg.(type) {
+	case *Response:
+		if realLength == -1 && !t.Chunked && bodyAllowedForStatus(t.StatusCode) {
+			// Unbounded body.
+			t.Close = true
+		}
+	}
+
+	// Prepare body reader. ContentLength < 0 means chunked encoding
+	// or close connection when finished, since multipart is not supported yet
+	switch {
+	case t.Chunked:
+		if noResponseBodyExpected(t.RequestMethod) || !bodyAllowedForStatus(t.StatusCode) {
+			t.Body = NoBody
+		} else {
+			t.Body = &body{src: internal.NewChunkedReader(r), hdr: msg, r: r, closing: t.Close}
+		}
+	case realLength == 0:
+		t.Body = NoBody
+	case realLength > 0:
+		t.Body = &body{src: io.LimitReader(r, realLength), closing: t.Close}
+	default:
+		// realLength < 0, i.e. "Content-Length" not mentioned in header
+		if t.Close {
+			// Close semantics (i.e. HTTP/1.0)
+			t.Body = &body{src: r, closing: t.Close}
+		} else {
+			// Persistent connection (i.e. HTTP/1.1)
+			t.Body = NoBody
+		}
+	}
+
+	// Unify output
+	switch rr := msg.(type) {
+	case *Request:
+		rr.Body = t.Body
+		rr.ContentLength = t.ContentLength
+		if t.Chunked {
+			rr.TransferEncoding = []string{"chunked"}
+		}
+		rr.Close = t.Close
+		rr.Trailer = t.Trailer
+	case *Response:
+		rr.Body = t.Body
+		rr.ContentLength = t.ContentLength
+		if t.Chunked {
+			rr.TransferEncoding = []string{"chunked"}
+		}
+		rr.Close = t.Close
+		rr.Trailer = t.Trailer
+	}
+
+	return nil
+}
+```
+
+
