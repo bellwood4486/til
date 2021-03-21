@@ -179,8 +179,8 @@ func (c *conn) serve(ctx context.Context) {
 	c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
 
 	for {
-		// この`readRequest()`内で、このconnの一つ下の層(TCPなど)のタイムアウトが設定されている
-		// HTTP関連のタイムアウトが同実現されているかを調べるときに関係ありそう。
+		// ハンドラーに渡ってくるリクエストやレスポンスはここで作られる。
+		// かなりいろんなことをやっている。戻り値の型(Response)のフィールドの一つにリクエストの情報が含まれている。
 		w, err := c.readRequest(ctx)
 		if c.r.remain != c.server.initialReadLimitSize() {
 			// If we read any bytes off the wire, we're active.
@@ -402,7 +402,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 }
 ```
 
-### http.readRequest()
+### http.readRequest
 
 ```go
 func readRequest(b *bufio.Reader, deleteHostHeader bool) (req *Request, err error) {
@@ -488,6 +488,7 @@ func readRequest(b *bufio.Reader, deleteHostHeader bool) (req *Request, err erro
 
 	req.Close = shouldClose(req.ProtoMajor, req.ProtoMinor, req.Header, false)
 
+	// ここでBodyの読み込み方を決めている。実際に読み込んでおらずあくまで「読み込み方」だけを決めている。
 	err = readTransfer(req, b)
 	if err != nil {
 		return nil, err
@@ -507,7 +508,7 @@ func readRequest(b *bufio.Reader, deleteHostHeader bool) (req *Request, err erro
 }
 ```
 
-### http.readTransfer()
+### http.readTransfer
 
 ```go
 // msg is *Request or *Response.
@@ -550,6 +551,7 @@ func readTransfer(msg interface{}, r *bufio.Reader) (err error) {
 		return err
 	}
 
+	// HTTP request sumggling などを考慮しつつ、コンテンツの長さを返す。
 	realLength, err := fixLength(isResponse, t.StatusCode, t.RequestMethod, t.Header, t.Chunked)
 	if err != nil {
 		return err
@@ -563,7 +565,10 @@ func readTransfer(msg interface{}, r *bufio.Reader) (err error) {
 	} else {
 		t.ContentLength = realLength
 	}
-
+	
+	// Trailerヘッダーというのがあり、それに関する処理のようだが深堀りはスキップする。
+	// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Trailer
+	//
 	// Trailer
 	t.Trailer, err = fixTrailer(t.Header, t.Chunked)
 	if err != nil {
@@ -581,6 +586,8 @@ func readTransfer(msg interface{}, r *bufio.Reader) (err error) {
 		}
 	}
 
+	// ここでボディのボディの読み込み方を決定している。
+	//
 	// Prepare body reader. ContentLength < 0 means chunked encoding
 	// or close connection when finished, since multipart is not supported yet
 	switch {
@@ -605,6 +612,8 @@ func readTransfer(msg interface{}, r *bufio.Reader) (err error) {
 		}
 	}
 
+	// これまで準備した`transferReader`の情報を、リクエストまたはレスポンスにセットする。
+	//
 	// Unify output
 	switch rr := msg.(type) {
 	case *Request:
