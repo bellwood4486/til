@@ -180,7 +180,7 @@ func (c *conn) serve(ctx context.Context) {
 
 	for {
 		// ハンドラーに渡ってくるリクエストやレスポンスはここで作られる。
-		// かなりいろんなことをやっている。戻り値の型(Response)のフィールドの一つにリクエストの情報が含まれている。
+		// かなりいろんなことをやっている。戻り値の型(`http.response`※小文字で始まるのに注意)のフィールドの一つにリクエスト(`http.Request`)の情報が含まれている。
 		w, err := c.readRequest(ctx)
 		if c.r.remain != c.server.initialReadLimitSize() {
 			// If we read any bytes off the wire, we're active.
@@ -242,6 +242,8 @@ func (c *conn) serve(ctx context.Context) {
 
 		c.curReq.Store(w)
 
+		// クライアントからコネクションが切れたことを補足している肝はここ。
+		// リクエストボディがEOFに達したら(ボディが全部読み込まれたら)裏でそのコネクションを監視する人を、ここで登録している。
 		if requestBodyRemains(req.Body) {
 			registerOnHitEOF(req.Body, w.conn.r.startBackgroundRead)
 		} else {
@@ -260,6 +262,9 @@ func (c *conn) serve(ctx context.Context) {
 		if c.hijacked() {
 			return
 		}
+		
+		// この`finishRequest`内部で、前段で登録した`startBackgroundRead`を解放してあげている。
+		// 具体的には`abortPendingRead`を呼び出すところ。
 		w.finishRequest()
 		if !w.shouldReuseConnection() {
 			if w.requestBodyLimitHit || w.closedRequestBodyEarly() {
@@ -638,4 +643,120 @@ func readTransfer(msg interface{}, r *bufio.Reader) (err error) {
 }
 ```
 
+### *connReader.startBackgroundRead
 
+```go
+func (cr *connReader) startBackgroundRead() {
+	cr.lock()
+	defer cr.unlock()
+	if cr.inRead {
+		panic("invalid concurrent Body.Read call")
+	}
+	if cr.hasByte {
+		return
+	}
+	cr.inRead = true
+	cr.conn.rwc.SetReadDeadline(time.Time{})
+	
+	// ここで裏でコネクションを監視するゴルーチンをスタートしている
+	go cr.backgroundRead()
+}
+```
+
+### *connReader.backgroundRead
+
+```go
+func (cr *connReader) backgroundRead() {
+	// このメソッドは、リクエストボディがEOFに達したら(読み込み終わったら)呼ばれる前提なので、
+	// `Read`をしても何も返らずブロック状態になる。
+	n, err := cr.conn.rwc.Read(cr.byteBuf[:])
+	cr.lock()
+	if n == 1 {
+		cr.hasByte = true
+		// We were past the end of the previous request's body already
+		// (since we wouldn't be in a background read otherwise), so
+		// this is a pipelined HTTP request. Prior to Go 1.11 we used to
+		// send on the CloseNotify channel and cancel the context here,
+		// but the behavior was documented as only "may", and we only
+		// did that because that's how CloseNotify accidentally behaved
+		// in very early Go releases prior to context support. Once we
+		// added context support, people used a Handler's
+		// Request.Context() and passed it along. Having that context
+		// cancel on pipelined HTTP requests caused problems.
+		// Fortunately, almost nothing uses HTTP/1.x pipelining.
+		// Unfortunately, apt-get does, or sometimes does.
+		// New Go 1.11 behavior: don't fire CloseNotify or cancel
+		// contexts on pipelined requests. Shouldn't affect people, but
+		// fixes cases like Issue 23921. This does mean that a client
+		// closing their TCP connection after sending a pipelined
+		// request won't cancel the context, but we'll catch that on any
+		// write failure (in checkConnErrorWriter.Write).
+		// If the server never writes, yes, there are still contrived
+		// server & client behaviors where this fails to ever cancel the
+		// context, but that's kinda why HTTP/1.x pipelining died
+		// anyway.
+	}
+	// 前段の`Read`が
+	if ne, ok := err.(net.Error); ok && cr.aborted && ne.Timeout() {
+		// ここにくるのは想定内で、別のゴルーチンが`abortPendingRead`を呼んだとき。
+		// `abortPendingRead`を呼ぶと、内部では強制的にタイムアウトが引き起こされるから、`ne.Timeout`も`true`になる。
+		// 正常にアプリのハンドラーの処理が完了した場合でも、`finishRequest`経由で`abortPendingRead`が呼ばれるのでここにくる。
+		//
+		// Ignore this error. It's the expected error from
+		// another goroutine calling abortPendingRead.
+	} else if err != nil {
+		// ここに来るケースは、`Read`メソッドから想定外のエラーが返されたとき。
+		// 「想定外が起こる」＝「コネクションが切れた」、という扱いをしているっぽい。
+		// この`handleReadError`内で`cancelCtx`が呼ばれている。
+		cr.handleReadError(err)
+	}
+	cr.aborted = false
+	cr.inRead = false
+	cr.unlock()
+	cr.cond.Broadcast()
+}
+```
+
+### *connReader.abortPendingRead
+
+```go
+func (cr *connReader) abortPendingRead() {
+	cr.lock()
+	defer cr.unlock()
+	if !cr.inRead {
+		return
+	}
+	cr.aborted = true
+	// デッドラインを昔にセットすることで強制的に`rwc.Read`をタイムアウトにしている。これが瞬時にコネクションのクローズを検知できているポイントの一つ。
+	// `net.Conn.SetReadline`はこの時点で既にブロック状態の`Read`にもデッドラインを適用できる。(コメント参照)
+	// なぜそれが可能かというと、ネットI/Oはユーザーからみたら同期的なI/Fに見えるが、裏では非同期で扱えるようになっているため。
+	// see: https://qiita.com/behiron/items/9b6975de6ff470c71e06
+	cr.conn.rwc.SetReadDeadline(aLongTimeAgo)
+	// ここの`inRead`が`false`に変わるのは、前述の`backgroundRead`の最後にある`cr.inRead = false`をしたとき。
+	for cr.inRead {
+		cr.cond.Wait()
+	}
+	// ここで昔にセットしたタイムアウトを戻している。`cr`を使い回すため。
+	cr.conn.rwc.SetReadDeadline(time.Time{})
+}
+```
+
+### *connReader.handleReadError
+
+```go
+// handleReadError is called whenever a Read from the client returns a
+// non-nil error.
+//
+// The provided non-nil err is almost always io.EOF or a "use of
+// closed network connection". In any case, the error is not
+// particularly interesting, except perhaps for debugging during
+// development. Any error means the connection is dead and we should
+// down its context.
+//
+// It may be called from multiple goroutines.
+func (cr *connReader) handleReadError(_ error) {
+	// このコードがリクエストのctxがキャンセルされる大本。
+	cr.conn.cancelCtx()
+	cr.closeNotify()
+}
+```
